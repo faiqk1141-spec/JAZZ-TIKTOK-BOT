@@ -40,6 +40,8 @@ from urllib.parse import urlparse
 import bot as app
 
 
+VERSION = "v3-debug"      # naye code ki pehchan: bot ke messages mein (run_bot v3-debug) likha aayega
+
 # ─── Files ────────────────────────────────────────────────────
 PROFILES_FILE = "tiktok_profiles.json"   # sources + settings
 SEEN_FILE = "tiktok_seen.json"           # upload ho chuki video IDs
@@ -184,6 +186,8 @@ def kind_of(key):
 # ─── Listing ──────────────────────────────────────────────────
 
 _VIDEO_RE = re.compile(r"tiktok\.com/@([\w.]+)/video/(\d+)")
+_diag = {}            # key -> pichle scan mein kya hua (masla batane ke liye)
+_scrape_note = [""]   # browser ne page par kya dekha
 
 
 def _ytdlp_list(url, cookies=True):
@@ -270,6 +274,12 @@ def scrape_video_links(page_url, max_items=150):
                     break
                 page.mouse.wheel(0, 5000)
                 time.sleep(2)
+            if not found:
+                try:
+                    body = page.inner_text("body", timeout=3000)[:120].replace("\n", " ")
+                except Exception:
+                    body = ""
+                _scrape_note[0] = f"browser title='{page.title()[:60]}' text='{body}'"
         finally:
             browser.close()
     return list(found.items())
@@ -280,13 +290,22 @@ def list_source_videos(key, info, max_items=MAX_NEW_PER_SCAN + 50):
     if kind == "user":
         return list_profile_videos(name)
     url = f"https://www.tiktok.com/tag/{name}" if kind == "tag" else f"https://www.tiktok.com/music/original-sound-{name}"
+    notes = []
     try:
         vids = _ytdlp_list(url)
         if vids:
+            _diag.pop(key, None)
             return vids
+        notes.append("yt-dlp: 0 videos")
     except Exception as e:
+        notes.append("yt-dlp: " + str(e).strip().replace("\n", " ")[:140])
         print(f"[tiktok] yt-dlp {label(key)} fail, browser se try: {str(e)[:100]}", flush=True)
-    return scrape_video_links(url, max_items=max_items)
+    _scrape_note[0] = ""
+    vids = scrape_video_links(url, max_items=max_items)
+    if not vids and _scrape_note[0]:
+        notes.append(_scrape_note[0])
+    _diag[key] = " | ".join(notes)
+    return vids
 
 
 # ─── Pakistan trending ────────────────────────────────────────
@@ -373,6 +392,8 @@ class TikAuto:
         for k, v in dict(data.get("profiles", {})).items():
             if ":" not in k:
                 k, v = make_key("user", k), {**v, "type": "user", "name": k}
+            if v.get("auto"):
+                continue       # auto (trending/extra) sources har run mein naye sire se bante hain; purane junk hat jate hain
             self.sources[k] = v
         self.seen = {str(x) for x in _read_json(SEEN_FILE, [])}
         self.fails = {str(k): int(v) for k, v in _read_json(FAILED_FILE, {}).items()}
@@ -540,7 +561,7 @@ class TikAuto:
                 self.warned.discard(key)
                 if found == 0 and key not in self.warned:
                     self.warned.add(key)
-                    problems.append(f"{label(key)}: koi video nahi mili (private / TikTok block?)")
+                    problems.append(f"{label(key)}: koi video nahi mili\n   {_diag.get(key, '')[:260]}")
             except Exception as e:
                 self.last_scan[key] = time.time()
                 if key not in self.warned:
@@ -769,11 +790,11 @@ class TikAuto:
             if self.login_at is None:
                 if app.session_valid(self.inst.state_file):
                     self.login_at = time.time()
-                    self.notify(f"JazzDrive login mil gaya!\nAuto-upload {self.start_delay} minute baad shuru hoga "
+                    self.notify(f"JazzDrive login mil gaya! (run_bot {VERSION})\nAuto-upload {self.start_delay} minute baad shuru hoga "
                                 f"(tab tak videos ki list tayyar kar raha hoon).")
                 elif not told_login:
                     told_login = True
-                    self.notify(f"TikTok auto-upload tayyar hai. JazzDrive login karo (/login) — "
+                    self.notify(f"TikTok auto-upload tayyar hai (run_bot {VERSION}). JazzDrive login karo (/login) — "
                                 f"login ke {self.start_delay} minute baad upload khud shuru ho jayega.")
             else:
                 if time.time() - self.login_at >= self.start_delay * 60:
@@ -1016,7 +1037,7 @@ def _install_hooks():
             else:
                 state = "upload chal raha hai"
             bot.reply_to(m,
-                f"TikTok auto: {state}\n"
+                f"TikTok auto: {state} (run_bot {VERSION})\n"
                 f"Auto-trending: {'ON' if auto.trend_on else 'OFF'}\n"
                 f"Sources: {kinds['user']} profiles, {kinds['tag']} hashtags, {kinds['sound']} sounds\n"
                 f"Total uploaded: {len(auto.seen)} (is run mein {auto.session_done})\n"
