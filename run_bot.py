@@ -30,6 +30,7 @@ import glob
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 from collections import deque
@@ -38,6 +39,8 @@ from urllib.parse import urlparse
 
 import bot as app
 
+
+VERSION = "v4-net"      # naye code ki pehchan: bot ke messages mein (run_bot v3-debug) likha aayega
 
 # ─── Files ────────────────────────────────────────────────────
 PROFILES_FILE = "tiktok_profiles.json"   # sources + settings
@@ -63,6 +66,7 @@ MAX_CONSEC_FAIL = 6                 # lagataar itne fail -> 10 minute ruk kar do
 FAIL_COOLDOWN = 10 * 60
 GAP_SECONDS = 2                     # videos ke beech gap
 PROGRESS_EVERY = 25                 # itni uploads ke baad ek progress message
+FEED_PUSH_EVERY = 10 * 60           # feed.json GitHub par itne second baad push (app ko nayi videos dikhein)
 
 # Trending na mile to ye pehle lagte hain
 DEFAULT_PK_TAGS = ["pakistan", "pakistanitiktok", "foryoupakistan", "lahore", "karachi", "urdu"]
@@ -100,6 +104,35 @@ def _write_json(path, data):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
+
+
+_last_feed_push = [0.0]
+_push_lock = threading.Lock()
+
+
+def push_feed(force=False):
+    """feed.json ko GitHub par (plain, app ke liye) push karo — har 10 minute mein ek baar."""
+    if not force and time.time() - _last_feed_push[0] < FEED_PUSH_EVERY:
+        return
+    if not os.path.exists("feed.json") or not _push_lock.acquire(blocking=False):
+        return
+    try:
+        _last_feed_push[0] = time.time()
+        run = lambda *a: subprocess.run(list(a), capture_output=True, text=True, timeout=90)
+        run("git", "config", "user.name", "github-actions[bot]")
+        run("git", "config", "user.email", "github-actions[bot]@users.noreply.github.com")
+        run("git", "add", "feed.json")
+        r = run("git", "commit", "-m", "Update feed.json [skip ci]")
+        if "nothing to commit" in (r.stdout + r.stderr):
+            return
+        run("git", "pull", "--rebase", "--autostash", "origin", "main")
+        p = run("git", "push", "origin", "HEAD:main")
+        if p.returncode != 0:
+            print(f"[tiktok] feed push fail: {p.stderr[-200:]}", flush=True)
+    except Exception as e:
+        print(f"[tiktok] feed push error: {str(e)[:150]}", flush=True)
+    finally:
+        _push_lock.release()
 
 
 # ─── Source parsing ───────────────────────────────────────────
@@ -153,6 +186,8 @@ def kind_of(key):
 # ─── Listing ──────────────────────────────────────────────────
 
 _VIDEO_RE = re.compile(r"tiktok\.com/@([\w.]+)/video/(\d+)")
+_diag = {}            # key -> pichle scan mein kya hua (masla batane ke liye)
+_scrape_note = [""]   # browser ne page par kya dekha
 
 
 def _ytdlp_list(url, cookies=True):
@@ -212,15 +247,76 @@ def _new_browser_page(p):
     return browser, ctx.new_page()
 
 
+def _collect_items(obj, found):
+    """TikTok ke JSON (API ya page data) mein se video id + author nikalo."""
+    if isinstance(obj, dict):
+        vid = str(obj.get("id", ""))
+        if vid.isdigit() and len(vid) >= 15 and ("desc" in obj or "video" in obj or "createTime" in obj):
+            a = obj.get("author")
+            uid = a.get("uniqueId") if isinstance(a, dict) else (a if isinstance(a, str) else None)
+            if uid and vid not in found:
+                found[vid] = f"https://www.tiktok.com/@{uid}/video/{vid}"
+        for v in obj.values():
+            _collect_items(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_items(v, found)
+
+
+def _dismiss_popups(page):
+    for text in ("Accept all", "Allow all", "Decline optional cookies", "Not now", "Close", "Continue as guest"):
+        try:
+            btn = page.locator(f"button:has-text('{text}')").first
+            if btn.count() and btn.is_visible():
+                btn.click(timeout=1500)
+        except Exception:
+            pass
+
+
 def scrape_video_links(page_url, max_items=150):
+    """
+    Hashtag / sound / profile page browser mein kholo. Videos TikTok ke apne network
+    responses (item_list API) aur page ke data (rehydration JSON) se, plus page ke links se.
+    """
     from playwright.sync_api import sync_playwright
 
     found = {}
+    api_info = {"n": 0, "codes": []}
     with sync_playwright() as p:
         browser, page = _new_browser_page(p)
         try:
+            def on_response(resp):
+                try:
+                    u = resp.url
+                    if "tiktok" in u and any(k in u for k in ("item_list", "/api/challenge", "/api/post", "/api/music",
+                                                               "/api/recommend", "/api/explore", "/api/search")):
+                        if "json" in (resp.headers.get("content-type") or ""):
+                            data = resp.json()
+                            api_info["n"] += 1
+                            code = data.get("statusCode", data.get("status_code")) if isinstance(data, dict) else None
+                            if code is not None and len(api_info["codes"]) < 4:
+                                api_info["codes"].append(code)
+                            _collect_items(data, found)
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
             page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(6)
+            time.sleep(7)
+            _dismiss_popups(page)
+
+            # page ke andar ka data (script JSON)
+            try:
+                html = page.content()
+                for m in re.finditer(r'<script id="(?:__UNIVERSAL_DATA_FOR_REHYDRATION__|SIGI_STATE)"[^>]*>(.*?)</script>',
+                                     html, re.S):
+                    try:
+                        _collect_items(json.loads(m.group(1)), found)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             stale = 0
             for _ in range(SCROLL_ROUNDS):
                 try:
@@ -239,9 +335,17 @@ def scrape_video_links(page_url, max_items=150):
                     break
                 page.mouse.wheel(0, 5000)
                 time.sleep(2)
+
+            if not found:
+                try:
+                    body = page.inner_text("body", timeout=3000)[:100].replace("\n", " ")
+                except Exception:
+                    body = ""
+                _scrape_note[0] = (f"browser title='{page.title()[:50]}' api_resp={api_info['n']} "
+                                   f"codes={api_info['codes']} text='{body}'")
         finally:
             browser.close()
-    return list(found.items())
+    return list(found.items())[:max_items]
 
 
 def list_source_videos(key, info, max_items=MAX_NEW_PER_SCAN + 50):
@@ -249,13 +353,22 @@ def list_source_videos(key, info, max_items=MAX_NEW_PER_SCAN + 50):
     if kind == "user":
         return list_profile_videos(name)
     url = f"https://www.tiktok.com/tag/{name}" if kind == "tag" else f"https://www.tiktok.com/music/original-sound-{name}"
+    notes = []
     try:
         vids = _ytdlp_list(url)
         if vids:
+            _diag.pop(key, None)
             return vids
+        notes.append("yt-dlp: 0 videos")
     except Exception as e:
+        notes.append("yt-dlp: " + str(e).strip().replace("\n", " ")[:140])
         print(f"[tiktok] yt-dlp {label(key)} fail, browser se try: {str(e)[:100]}", flush=True)
-    return scrape_video_links(url, max_items=max_items)
+    _scrape_note[0] = ""
+    vids = scrape_video_links(url, max_items=max_items)
+    if not vids and _scrape_note[0]:
+        notes.append(_scrape_note[0])
+    _diag[key] = " | ".join(notes)
+    return vids
 
 
 # ─── Pakistan trending ────────────────────────────────────────
@@ -312,10 +425,6 @@ def fetch_pk_trending():
                     time.sleep(10)
                     page.mouse.wheel(0, 1500)
                     time.sleep(3)
-                    if is_tags and not tags:
-                        text = page.inner_text("body", timeout=5000)
-                        for m in re.finditer(r"#\s?([\w]{2,40})", text, re.UNICODE):
-                            add_tag(m.group(1))
                     if not is_tags and not sounds:
                         hrefs = page.eval_on_selector_all("a[href*='/music/']", "els => els.map(e => e.href)")
                         for h in hrefs:
@@ -346,6 +455,8 @@ class TikAuto:
         for k, v in dict(data.get("profiles", {})).items():
             if ":" not in k:
                 k, v = make_key("user", k), {**v, "type": "user", "name": k}
+            if v.get("auto"):
+                continue       # auto (trending/extra) sources har run mein naye sire se bante hain; purane junk hat jate hain
             self.sources[k] = v
         self.seen = {str(x) for x in _read_json(SEEN_FILE, [])}
         self.fails = {str(k): int(v) for k, v in _read_json(FAILED_FILE, {}).items()}
@@ -513,7 +624,7 @@ class TikAuto:
                 self.warned.discard(key)
                 if found == 0 and key not in self.warned:
                     self.warned.add(key)
-                    problems.append(f"{label(key)}: koi video nahi mili (private / TikTok block?)")
+                    problems.append(f"{label(key)}: koi video nahi mili\n   {_diag.get(key, '')[:260]}")
             except Exception as e:
                 self.last_scan[key] = time.time()
                 if key not in self.warned:
@@ -652,12 +763,71 @@ class TikAuto:
                         f"Run ka waqt: {int(self.elapsed_min())} min")
         return None
 
+    # ─── Debug: TikTok se kya mil raha hai? ───────────────────
+    def debug_source(self, target):
+        inst = self.inst
+        t = (target or "#pakistan").strip()
+        if t.startswith("@") or (not t.startswith("#") and parse_profile(t) and "tiktok.com" not in t):
+            name = parse_profile(t)
+            url = f"https://www.tiktok.com/@{name}"
+        else:
+            name = parse_tag(t) or "pakistan"
+            url = f"https://www.tiktok.com/tag/{name}"
+        inst.msg(f"DEBUG shuru: {url}")
+
+        # 1) yt-dlp
+        try:
+            vids = _ytdlp_list(url)
+            inst.msg(f"1) yt-dlp: {len(vids)} videos mili" + (f"\nPehli: {vids[0][1]}" if vids else ""))
+        except Exception as e:
+            inst.msg(f"1) yt-dlp FAIL:\n{str(e)[:400]}")
+
+        # 2) browser
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser, page = _new_browser_page(p)
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(8)
+                    n = page.eval_on_selector_all("a[href*='/video/']", "els => els.length")
+                    title = page.title()
+                    body = ""
+                    try:
+                        body = page.inner_text("body", timeout=4000)[:250].replace("\n", " | ")
+                    except Exception:
+                        pass
+                    inst.msg(f"2) Browser: title='{title[:80]}'\nvideo links page par: {n}\nText: {body}")
+                    inst.take_screenshot(page, "TikTok page jo bot ko dikha")
+                finally:
+                    browser.close()
+        except Exception as e:
+            inst.msg(f"2) Browser FAIL: {str(e)[:300]}")
+
+        # 3) trending page
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser, page = _new_browser_page(p)
+                try:
+                    page.goto(CREATIVE_CENTER_TAGS, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(10)
+                    inst.take_screenshot(page, "Creative Center (trending) page")
+                finally:
+                    browser.close()
+            tags, sounds = fetch_pk_trending()
+            inst.msg(f"3) Trending: tags={tags[:10]} sounds={sounds[:5]}")
+        except Exception as e:
+            inst.msg(f"3) Trending FAIL: {str(e)[:300]}")
+        inst.msg("DEBUG khatam. Ye saare messages + screenshots mujhe bhej do.")
+
     # ─── Loop ─────────────────────────────────────────────────
 
     def finish_run(self):
         self.save_seen()
         self.save_fails()
         self.save_sources()
+        push_feed(force=True)
         self.notify(f"TikTok auto: ye run khatam hone wala hai.\n"
                     f"Is run mein {self.session_done} videos upload hui. Total: {len(self.seen)} | Pending: {self.pending_count()}\n"
                     f"Agla scheduled run khud wahin se shuru karega.")
@@ -683,11 +853,11 @@ class TikAuto:
             if self.login_at is None:
                 if app.session_valid(self.inst.state_file):
                     self.login_at = time.time()
-                    self.notify(f"JazzDrive login mil gaya!\nAuto-upload {self.start_delay} minute baad shuru hoga "
+                    self.notify(f"JazzDrive login mil gaya! (run_bot {VERSION})\nAuto-upload {self.start_delay} minute baad shuru hoga "
                                 f"(tab tak videos ki list tayyar kar raha hoon).")
                 elif not told_login:
                     told_login = True
-                    self.notify(f"TikTok auto-upload tayyar hai. JazzDrive login karo (/login) — "
+                    self.notify(f"TikTok auto-upload tayyar hai (run_bot {VERSION}). JazzDrive login karo (/login) — "
                                 f"login ke {self.start_delay} minute baad upload khud shuru ho jayega.")
             else:
                 if time.time() - self.login_at >= self.start_delay * 60:
@@ -773,6 +943,7 @@ def _install_hooks():
 
     app.BotInstance.msg = quiet_msg
     app.append_feed = append_feed_mark
+    app.git_push_feed = push_feed          # feed.json har 10 minute mein GitHub par
 
     orig_register = app.BotInstance.register_handlers
 
@@ -793,6 +964,7 @@ def _install_hooks():
                 "/tiktok_trending — Pakistan trending abhi lao\n"
                 "/tiktok_trend on|off — auto-trending\n"
                 "/tiktok_delay 10 — login ke kitne minute baad shuru\n"
+                "/tiktok_debug [#tag|@user] — TikTok se kya mil raha hai\n"
                 "/tiktok_list /tiktok_status /tiktok_scan\n"
                 "/tiktok_pause /tiktok_resume /tiktok_retry\n"
                 "/tiktok_remove @user | #tag | sound-id")
@@ -832,6 +1004,14 @@ def _install_hooks():
         def cmd_sound(m):
             if allowed(m):
                 add_many(m, "sound", parse_sound, lambda n: "sound " + n)
+
+        @bot.message_handler(commands=["tiktok_debug"])
+        def cmd_debug(m):
+            if not allowed(m):
+                return
+            target = (args(m) or ["#pakistan"])[0]
+            bot.reply_to(m, "Debug chal raha hai (1 se 2 minute)...")
+            threading.Thread(target=lambda: auto.debug_source(target), daemon=True).start()
 
         @bot.message_handler(commands=["tiktok_trending"])
         def cmd_trending(m):
@@ -920,7 +1100,7 @@ def _install_hooks():
             else:
                 state = "upload chal raha hai"
             bot.reply_to(m,
-                f"TikTok auto: {state}\n"
+                f"TikTok auto: {state} (run_bot {VERSION})\n"
                 f"Auto-trending: {'ON' if auto.trend_on else 'OFF'}\n"
                 f"Sources: {kinds['user']} profiles, {kinds['tag']} hashtags, {kinds['sound']} sounds\n"
                 f"Total uploaded: {len(auto.seen)} (is run mein {auto.session_done})\n"
