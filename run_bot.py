@@ -40,7 +40,7 @@ from urllib.parse import urlparse
 import bot as app
 
 
-VERSION = "v4-net"      # naye code ki pehchan: bot ke messages mein (run_bot v3-debug) likha aayega
+VERSION = "v5-feed"      # naye code ki pehchan: bot ke messages mein (run_bot v3-debug) likha aayega
 
 # ─── Files ────────────────────────────────────────────────────
 PROFILES_FILE = "tiktok_profiles.json"   # sources + settings
@@ -52,6 +52,8 @@ START_DELAY_MIN = 10                # login ke itne minute baad upload shuru (/t
 RUN_LIMIT_MIN = 330                 # itne minute baad naya video nahi uthana, saaf band (workflow step 335 min ka hai)
 SCAN_INTERVAL_USER = 30 * 60        # profiles dobara scan
 SCAN_INTERVAL_TAG = 2 * 60 * 60     # hashtag / sound pages dobara scan
+SCAN_INTERVAL_FEED = 20 * 60        # Pakistan trending feed dobara scan
+FEED_API = "https://www.tikwm.com/api/feed/list"   # region ki trending feed (login ki zaroorat nahi)
 TREND_REFRESH = 6 * 60 * 60         # trending list refresh
 MAX_NEW_PER_SCAN = 100              # ek hashtag/sound ke ek scan mein nayi videos (profile par koi limit nahi)
 STARVE_SCAN_CAP = 300               # queue khali ho to cap barh jata hai
@@ -171,16 +173,16 @@ def parse_sound(token):
 
 
 def make_key(kind, name):
-    return {"user": "u:", "tag": "t:", "sound": "s:"}[kind] + name
+    return {"user": "u:", "tag": "t:", "sound": "s:", "feed": "f:"}[kind] + name
 
 
 def label(key):
     kind, name = key.split(":", 1)
-    return {"u": f"@{name}", "t": f"#{name}", "s": f"sound {name}"}[kind]
+    return {"u": f"@{name}", "t": f"#{name}", "s": f"sound {name}", "f": f"Pakistan trending feed ({name.upper()})"}[kind]
 
 
 def kind_of(key):
-    return {"u": "user", "t": "tag", "s": "sound"}[key[0]]
+    return {"u": "user", "t": "tag", "s": "sound", "f": "feed"}[key[0]]
 
 
 # ─── Listing ──────────────────────────────────────────────────
@@ -348,8 +350,45 @@ def scrape_video_links(page_url, max_items=150):
     return list(found.items())[:max_items]
 
 
+def fetch_region_feed(region="PK", pages=4):
+    """Region (PK) ki trending feed ki videos — TikTok login ke bina. Returns [(id, tiktok_url)]."""
+    import requests
+
+    out, seen_ids, last = [], set(), ""
+    for _ in range(pages):
+        try:
+            r = requests.get(FEED_API, params={"region": region, "count": 30},
+                             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36"},
+                             timeout=30)
+            data = r.json()
+        except Exception as e:
+            last = f"feed API error: {str(e)[:150]}"
+            break
+        if not isinstance(data, dict) or str(data.get("code")) not in ("0",):
+            last = f"feed API jawab: {str(data)[:200]}"
+            break
+        items = data.get("data") or []
+        if isinstance(items, dict):
+            items = items.get("videos") or items.get("list") or []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            vid = str(it.get("video_id") or it.get("id") or "")
+            a = it.get("author") or {}
+            uid = (a.get("unique_id") or a.get("uniqueId")) if isinstance(a, dict) else None
+            if vid.isdigit() and uid and vid not in seen_ids:
+                seen_ids.add(vid)
+                out.append((vid, f"https://www.tiktok.com/@{uid}/video/{vid}"))
+        time.sleep(1.5)
+    if not out and last:
+        raise RuntimeError(last)
+    return out
+
+
 def list_source_videos(key, info, max_items=MAX_NEW_PER_SCAN + 50):
     kind, name = kind_of(key), info["name"]
+    if kind == "feed":
+        return fetch_region_feed(name.upper())
     if kind == "user":
         return list_profile_videos(name)
     url = f"https://www.tiktok.com/tag/{name}" if kind == "tag" else f"https://www.tiktok.com/music/original-sound-{name}"
@@ -460,6 +499,7 @@ class TikAuto:
             self.sources[k] = v
         self.seen = {str(x) for x in _read_json(SEEN_FILE, [])}
         self.fails = {str(k): int(v) for k, v in _read_json(FAILED_FILE, {}).items()}
+        self.add_source("feed", "pk")      # Pakistan trending feed: hamesha ek source (login ki zaroorat nahi)
 
         self.pool = {}
         self.inflight = set()
@@ -609,7 +649,7 @@ class TikAuto:
         total_new, problems, scanned = 0, [], 0
         for key in list(self.sources.keys()):
             kind = kind_of(key)
-            interval = SCAN_INTERVAL_USER if kind == "user" else SCAN_INTERVAL_TAG
+            interval = {"user": SCAN_INTERVAL_USER, "feed": SCAN_INTERVAL_FEED}.get(kind, SCAN_INTERVAL_TAG)
             due = self.force_scan or (time.time() - self.last_scan.get(key, 0) >= interval)
             if not due:
                 continue
@@ -629,7 +669,7 @@ class TikAuto:
                 self.last_scan[key] = time.time()
                 if key not in self.warned:
                     self.warned.add(key)
-                    problems.append(f"{label(key)}: list nahi ban saki ({str(e)[:100]})")
+                    problems.append(f"{label(key)}: list nahi ban saki ({str(e)[:220]})")
         self.force_scan = False
         if scanned and not quiet and (total_new and not self.started_uploading or problems):
             text = f"TikTok scan: {total_new} nayi videos queue mein.\nPending total: {self.pending_count()}"
@@ -819,6 +859,12 @@ class TikAuto:
             inst.msg(f"3) Trending: tags={tags[:10]} sounds={sounds[:5]}")
         except Exception as e:
             inst.msg(f"3) Trending FAIL: {str(e)[:300]}")
+        # 4) Pakistan trending feed (bina login)
+        try:
+            vids = fetch_region_feed("PK", pages=1)
+            inst.msg(f"4) Trending feed: {len(vids)} videos" + (f"\nPehli: {vids[0][1]}" if vids else ""))
+        except Exception as e:
+            inst.msg(f"4) Trending feed FAIL: {str(e)[:300]}")
         inst.msg("DEBUG khatam. Ye saare messages + screenshots mujhe bhej do.")
 
     # ─── Loop ─────────────────────────────────────────────────
@@ -1086,7 +1132,7 @@ def _install_hooks():
         def cmd_status(m):
             if not allowed(m):
                 return
-            kinds = {"user": 0, "tag": 0, "sound": 0}
+            kinds = {"user": 0, "tag": 0, "sound": 0, "feed": 0}
             for k in auto.sources:
                 kinds[kind_of(k)] += 1
             if auto.paused:
@@ -1102,7 +1148,7 @@ def _install_hooks():
             bot.reply_to(m,
                 f"TikTok auto: {state} (run_bot {VERSION})\n"
                 f"Auto-trending: {'ON' if auto.trend_on else 'OFF'}\n"
-                f"Sources: {kinds['user']} profiles, {kinds['tag']} hashtags, {kinds['sound']} sounds\n"
+                f"Sources: {kinds['user']} profiles, {kinds['tag']} hashtags, {kinds['sound']} sounds, {kinds['feed']} trending feed\n"
                 f"Total uploaded: {len(auto.seen)} (is run mein {auto.session_done})\n"
                 f"Pending: {auto.pending_count()}\n"
                 f"Failed (3 koshish ke baad): {auto.dead_count()}\n"
