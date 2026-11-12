@@ -343,10 +343,6 @@ def fetch_pk_trending():
                     time.sleep(10)
                     page.mouse.wheel(0, 1500)
                     time.sleep(3)
-                    if is_tags and not tags:
-                        text = page.inner_text("body", timeout=5000)
-                        for m in re.finditer(r"#\s?([\w]{2,40})", text, re.UNICODE):
-                            add_tag(m.group(1))
                     if not is_tags and not sounds:
                         hrefs = page.eval_on_selector_all("a[href*='/music/']", "els => els.map(e => e.href)")
                         for h in hrefs:
@@ -683,6 +679,64 @@ class TikAuto:
                         f"Run ka waqt: {int(self.elapsed_min())} min")
         return None
 
+    # ─── Debug: TikTok se kya mil raha hai? ───────────────────
+    def debug_source(self, target):
+        inst = self.inst
+        t = (target or "#pakistan").strip()
+        if t.startswith("@") or (not t.startswith("#") and parse_profile(t) and "tiktok.com" not in t):
+            name = parse_profile(t)
+            url = f"https://www.tiktok.com/@{name}"
+        else:
+            name = parse_tag(t) or "pakistan"
+            url = f"https://www.tiktok.com/tag/{name}"
+        inst.msg(f"DEBUG shuru: {url}")
+
+        # 1) yt-dlp
+        try:
+            vids = _ytdlp_list(url)
+            inst.msg(f"1) yt-dlp: {len(vids)} videos mili" + (f"\nPehli: {vids[0][1]}" if vids else ""))
+        except Exception as e:
+            inst.msg(f"1) yt-dlp FAIL:\n{str(e)[:400]}")
+
+        # 2) browser
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser, page = _new_browser_page(p)
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(8)
+                    n = page.eval_on_selector_all("a[href*='/video/']", "els => els.length")
+                    title = page.title()
+                    body = ""
+                    try:
+                        body = page.inner_text("body", timeout=4000)[:250].replace("\n", " | ")
+                    except Exception:
+                        pass
+                    inst.msg(f"2) Browser: title='{title[:80]}'\nvideo links page par: {n}\nText: {body}")
+                    inst.take_screenshot(page, "TikTok page jo bot ko dikha")
+                finally:
+                    browser.close()
+        except Exception as e:
+            inst.msg(f"2) Browser FAIL: {str(e)[:300]}")
+
+        # 3) trending page
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser, page = _new_browser_page(p)
+                try:
+                    page.goto(CREATIVE_CENTER_TAGS, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(10)
+                    inst.take_screenshot(page, "Creative Center (trending) page")
+                finally:
+                    browser.close()
+            tags, sounds = fetch_pk_trending()
+            inst.msg(f"3) Trending: tags={tags[:10]} sounds={sounds[:5]}")
+        except Exception as e:
+            inst.msg(f"3) Trending FAIL: {str(e)[:300]}")
+        inst.msg("DEBUG khatam. Ye saare messages + screenshots mujhe bhej do.")
+
     # ─── Loop ─────────────────────────────────────────────────
 
     def finish_run(self):
@@ -826,6 +880,7 @@ def _install_hooks():
                 "/tiktok_trending — Pakistan trending abhi lao\n"
                 "/tiktok_trend on|off — auto-trending\n"
                 "/tiktok_delay 10 — login ke kitne minute baad shuru\n"
+                "/tiktok_debug [#tag|@user] — TikTok se kya mil raha hai\n"
                 "/tiktok_list /tiktok_status /tiktok_scan\n"
                 "/tiktok_pause /tiktok_resume /tiktok_retry\n"
                 "/tiktok_remove @user | #tag | sound-id")
@@ -865,6 +920,14 @@ def _install_hooks():
         def cmd_sound(m):
             if allowed(m):
                 add_many(m, "sound", parse_sound, lambda n: "sound " + n)
+
+        @bot.message_handler(commands=["tiktok_debug"])
+        def cmd_debug(m):
+            if not allowed(m):
+                return
+            target = (args(m) or ["#pakistan"])[0]
+            bot.reply_to(m, "Debug chal raha hai (1 se 2 minute)...")
+            threading.Thread(target=lambda: auto.debug_source(target), daemon=True).start()
 
         @bot.message_handler(commands=["tiktok_trending"])
         def cmd_trending(m):
